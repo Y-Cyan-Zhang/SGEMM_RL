@@ -1,4 +1,6 @@
-## Performance Results
+# Performance Results
+
+## Wafer First Run
 
 Benchmarked on [GPU MODEL] with matrix dimensions m=n=k.
 
@@ -29,3 +31,5 @@ Benchmarked on [GPU MODEL] with matrix dimensions m=n=k.
 | 1024 | 0.000830 | 0.001210  |
 | 2048 | 0.004960 | 0.004933  |
 | 4096 | 0.032595 | 0.034596  |
+
+## Wafer Second Run

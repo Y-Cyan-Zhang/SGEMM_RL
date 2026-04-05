@@ -10,31 +10,58 @@
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
 /*
- * Optimized SGEMM with double buffering for SM 7.5 (T4).
+ * Highly-optimized SGEMM with double buffering for SM 7.5 (T4).
  *
- * Key optimizations vs the original SM 8.0+ version:
- * 1. Replaced cuda::barrier / cuda::memcpy_async with __syncthreads() and
- *    manual vectorized loads (float4) — T4 lacks cp.async hardware.
- * 2. Vectorized A loads: load float4 from global memory, scatter-transpose
- *    into shared memory (column-major layout for bank-conflict-free access).
- * 3. Added #pragma unroll on all inner loops.
- * 4. Added __restrict__ and --use_fast_math for compiler optimization.
- * 5. Proper double-buffering sync: 2x __syncthreads() per iteration to ensure
- *    (a) new data is ready before reading, (b) old data is not overwritten
- *    before all threads finish reading it.
+ * Optimizations over the previous version:
+ * ─────────────────────────────────────────
+ * 1. 256 threads/block (8 warps) → 25% occupancy (2× vs 128-thread version).
+ *    With 2 blocks/SM, the warp scheduler has 16 warps to interleave, much
+ *    better for hiding both memory and ALU latency on T4's Turing architecture.
  *
- * SMEM: 2*(BM*BK + BK*BN)*4 = 2*(128*16+16*128)*4 = 32KB (fits 2 blocks/SM)
+ * 2. 64 accumulators/thread (was 128). Halving register pressure means the
+ *    compiler can keep everything in registers without spilling. Estimated
+ *    ~110 regs/thread → 256×110 = 28160 regs/block, 2 blocks = 56320 < 65536.
+ *
+ * 3. __forceinline__ on all device helpers to eliminate call overhead and let
+ *    the compiler schedule instructions across load/compute boundaries.
+ *
+ * 4. Outer-product FMA structure: the `a` value is hoisted out of the inner
+ *    N-loop, giving the compiler a clean FMA dependency chain per N-element.
+ *
+ * 5. Vectorized float4 loads for both A (with register scatter-transpose) and B.
+ *
+ * 6. __restrict__ on all pointers + --use_fast_math.
+ *
+ * 7. __launch_bounds__(256) for optimal register allocation by the compiler.
+ *
+ * No SMEM padding needed: within a warp, threads read consecutive m-indices
+ * from As (stride-1), so all 32 threads hit different banks. The k-stride
+ * of BM=128 (which is 0 mod 32) does NOT cause conflicts because all threads
+ * in a warp read the SAME k-row in any given dotIdx iteration.
+ *
+ * Memory:
+ *   SMEM = 2 × (128×16 + 16×128) × 4 = 32768 bytes = 32 KB → 2 blocks in 64 KB
+ *
+ * Config: BM=128, BN=128, BK=16, WM=64, WN=32,
+ *         WNITER=2, TM=8, TN=4, 256 threads (8 warps)
+ *   Warp layout: 2×4 (2 rows, 4 cols)
+ *   WMITER=1, WSUBM=64, WSUBN=16
+ *   64 results/thread, ~110 regs/thread
  */
 
 namespace {
 
 template <const int BM, const int BN, const int BK, const int rowStrideA,
           const int rowStrideB>
-__device__ void loadFromGmem(int N, int K, const float *__restrict__ A,
-                             const float *__restrict__ B, float *As, float *Bs,
-                             int innerRowA, int innerColA, int innerRowB,
-                             int innerColB) {
-  // Load A tile with vectorized float4, then scatter-transpose into As[k][m]
+__device__ __forceinline__ void
+loadFromGmem(int N, int K,
+             const float *__restrict__ A,
+             const float *__restrict__ B,
+             float *__restrict__ As,
+             float *__restrict__ Bs,
+             int innerRowA, int innerColA,
+             int innerRowB, int innerColB) {
+  // Load A: float4 along K dimension, scatter-transpose into As[k * BM + m]
   #pragma unroll
   for (uint offset = 0; offset + rowStrideA <= BM; offset += rowStrideA) {
     const float4 tmp = reinterpret_cast<const float4 *>(
@@ -45,7 +72,7 @@ __device__ void loadFromGmem(int N, int K, const float *__restrict__ A,
     As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
   }
 
-  // Load B tile with vectorized float4 (already row-major, no transpose)
+  // Load B: float4 along N dimension (row-major, no transpose)
   #pragma unroll
   for (uint offset = 0; offset + rowStrideB <= BK; offset += rowStrideB) {
     reinterpret_cast<float4 *>(
@@ -58,44 +85,50 @@ __device__ void loadFromGmem(int N, int K, const float *__restrict__ A,
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WMITER, const int WNITER, const int WSUBM, const int WSUBN,
           const int TM, const int TN>
-__device__ void
-processFromSmem(float *regM, float *regN, float *threadResults,
-                const float *__restrict__ As, const float *__restrict__ Bs,
+__device__ __forceinline__ void
+processFromSmem(float *__restrict__ regM,
+                float *__restrict__ regN,
+                float *__restrict__ threadResults,
+                const float *__restrict__ As,
+                const float *__restrict__ Bs,
                 const uint warpRow, const uint warpCol,
                 const uint threadRowInWarp, const uint threadColInWarp) {
   #pragma unroll
   for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
+    // Load A tile column into registers
     #pragma unroll
     for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
       #pragma unroll
       for (uint i = 0; i < TM; ++i) {
         regM[wSubRowIdx * TM + i] =
-            As[(dotIdx * BM) + warpRow * WM + wSubRowIdx * WSUBM +
+            As[dotIdx * BM + warpRow * WM + wSubRowIdx * WSUBM +
                threadRowInWarp * TM + i];
       }
     }
+    // Load B tile row into registers
     #pragma unroll
     for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
       #pragma unroll
       for (uint i = 0; i < TN; ++i) {
         regN[wSubColIdx * TN + i] =
-            Bs[(dotIdx * BN) + warpCol * WN + wSubColIdx * WSUBN +
+            Bs[dotIdx * BN + warpCol * WN + wSubColIdx * WSUBN +
                threadColInWarp * TN + i];
       }
     }
 
+    // Outer-product accumulate with hoisted `a` for FMA chains
     #pragma unroll
     for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
       #pragma unroll
       for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
         #pragma unroll
         for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
+          const float a = regM[wSubRowIdx * TM + resIdxM];
           #pragma unroll
           for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
             threadResults[(wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
                           (wSubColIdx * TN) + resIdxN] +=
-                regM[wSubRowIdx * TM + resIdxM] *
-                regN[wSubColIdx * TN + resIdxN];
+                a * regN[wSubColIdx * TN + resIdxN];
           }
         }
       }
@@ -105,19 +138,6 @@ processFromSmem(float *regM, float *regN, float *threadResults,
 
 } // namespace
 
-/*
- * Double-buffered SGEMM kernel for SM 7.5+ (T4).
- *
- * Double-buffering with __syncthreads():
- *   Each iteration: load next tile → syncthreads → compute current tile → syncthreads
- *   The first syncthreads ensures the next tile's loads are visible.
- *   The second syncthreads ensures all threads are done reading the current
- *   tile before it gets overwritten in the next iteration.
- *
- *   Even though __syncthreads() is a hard barrier, the compiler still benefits
- *   because global loads are issued before the compute block, allowing memory
- *   latency to be partially hidden by the compute instructions that follow.
- */
 template <const int BM, const int BN, const int BK, const int WM, const int WN,
           const int WNITER, const int TM, const int TN, const int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
@@ -140,7 +160,7 @@ __global__ void __launch_bounds__(NUM_THREADS)
   const uint threadColInWarp = threadIdxInWarp % (WSUBN / TN);
   const uint threadRowInWarp = threadIdxInWarp / (WSUBN / TN);
 
-  // Double-buffered shared memory
+  // Double-buffered shared memory (no padding needed — see comment above)
   __shared__ float As[2 * BM * BK];
   __shared__ float Bs[2 * BK * BN];
 
@@ -161,47 +181,44 @@ __global__ void __launch_bounds__(NUM_THREADS)
 
   // Load first tile into buffer 0
   loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
-      N, K, A, B, &As[0], &Bs[0], innerRowA, innerColA, innerRowB, innerColB);
-  __syncthreads(); // S1: first tile is ready
+      N, K, A, B, &As[0], &Bs[0],
+      innerRowA, innerColA, innerRowB, innerColB);
+  __syncthreads();
 
-  // Main loop over K dimension (all tiles except the last)
+  // Main K-loop: all tiles except the last
   for (uint bkIdx = 0; bkIdx < K - BK; bkIdx += BK) {
-    // Determine which buffer holds the current data and which gets the next
-    int curBuf = (bkIdx / BK) & 1;      // 0, 1, 0, 1, ...
-    int nextBuf = 1 - curBuf;
+    const int curBuf = (bkIdx / BK) & 1;
+    const int nextBuf = 1 - curBuf;
 
-    // Issue loads for the NEXT tile into nextBuf
-    // These global loads are pipelined — the SM can start fetching while
-    // we're computing below.
+    // Issue loads for next tile into alternate buffer (global→shared)
     loadFromGmem<BM, BN, BK, rowStrideA, rowStrideB>(
-        N, K, A + BK, B + BK * N, &As[nextBuf * BM * BK],
-        &Bs[nextBuf * BK * BN], innerRowA, innerColA, innerRowB, innerColB);
+        N, K, A + BK, B + BK * N,
+        &As[nextBuf * BM * BK], &Bs[nextBuf * BK * BN],
+        innerRowA, innerColA, innerRowB, innerColB);
 
-    // Compute on the CURRENT tile (data is in curBuf, guaranteed ready by
-    // the __syncthreads that preceded this iteration)
+    // Compute current tile — compiler interleaves these with outstanding loads
     processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM, TN>(
-        regM, regN, threadResults, &As[curBuf * BM * BK],
-        &Bs[curBuf * BK * BN], warpRow, warpCol, threadRowInWarp,
-        threadColInWarp);
+        regM, regN, threadResults,
+        &As[curBuf * BM * BK], &Bs[curBuf * BK * BN],
+        warpRow, warpCol, threadRowInWarp, threadColInWarp);
 
     A += BK;
     B += BK * N;
 
-    // S2: ensures (a) all loads for nextBuf are committed to SMEM,
-    //             (b) all reads from curBuf are complete (safe to overwrite)
+    // Ensure next-tile loads complete and current-tile reads are done
     __syncthreads();
   }
 
   // Process the last tile
   {
-    int lastBuf = ((K / BK - 1)) & 1;  // which buffer holds the last tile
+    const int lastBuf = ((K / BK - 1)) & 1;
     processFromSmem<BM, BN, BK, WM, WN, WMITER, WNITER, WSUBM, WSUBN, TM, TN>(
-        regM, regN, threadResults, &As[lastBuf * BM * BK],
-        &Bs[lastBuf * BK * BN], warpRow, warpCol, threadRowInWarp,
-        threadColInWarp);
+        regM, regN, threadResults,
+        &As[lastBuf * BM * BK], &Bs[lastBuf * BK * BN],
+        warpRow, warpCol, threadRowInWarp, threadColInWarp);
   }
 
-  // Write results back to global memory (vectorized float4 stores)
+  // Write results back with alpha/beta scaling (vectorized float4 stores)
   #pragma unroll
   for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
     #pragma unroll

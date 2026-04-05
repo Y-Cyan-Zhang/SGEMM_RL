@@ -143,30 +143,28 @@ void runCublasTF32(cublasHandle_t handle, int M, int N, int K, float alpha,
 void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
                               float *B, float beta, float *C) {
   // =====================================================================
-  // Tile parameters tuned for T4 (SM 7.5)
+  // Tile parameters tuned for T4 (SM 7.5) — 256 threads, 25% occupancy
   //
-  // T4 specs:
-  //   - 40 SMs, 64 KB shared memory/SM, 65536 regs/SM
-  //   - 320 GB/s memory BW, ~8.1 TFLOPS FP32
-  //   - No hardware async copy (cp.async requires SM 8.0+)
+  //  Previous config:  128 threads, 128 results/thread, 12.5% occupancy
+  //  New config:       256 threads,  64 results/thread, 25.0% occupancy
   //
-  // SMEM usage: 2 * (BM*BK + BK*BN) * 4 bytes
-  //   = 2 * (128*16 + 16*128) * 4 = 32768 bytes = 32 KB
-  //   -> 2 blocks can run per SM (2*32KB = 64KB ≤ 64KB limit)
+  //  The 2× occupancy improvement gives the warp scheduler more warps to
+  //  choose from, hiding both memory and arithmetic latency better.
+  //  FLOPS/SM/tile stays the same (same BM×BN×BK), but utilization improves.
   //
-  // Register usage per thread:
-  //   threadResults = WMITER*TM*WNITER*TN = 2*8*4*4 = 256 floats (regs)
-  //   regM = WMITER*TM = 16, regN = WNITER*TN = 16
-  //   Total ~288 regs/thread → with 128 threads = ~288 regs/thread
-  //   65536 regs/SM / 128 threads = 512 regs/thread available → fits
+  //  SMEM: 2 × ((128+4)×16 + 16×128) × 4 = 2 × (2112+2048) × 4 = 33280B ≈ 32.5KB
+  //  → 2 blocks/SM within T4's 64KB
+  //
+  //  Registers: 64 accumulators + 8 regM + 8 regN + ~30 overhead ≈ 110 regs/thread
+  //  → 256 × 110 = 28160 regs/block → 2 blocks = 56320 < 65536 ✓
   // =====================================================================
-  const uint K12_NUM_THREADS = 128;
+  const uint K12_NUM_THREADS = 256;
   const uint K12_BN = 128;
   const uint K12_BM = 128;
   const uint K12_BK = 16;
-  const uint K12_WN = 64;
+  const uint K12_WN = 32;
   const uint K12_WM = 64;
-  const uint K12_WNITER = 4;
+  const uint K12_WNITER = 2;
   const uint K12_TN = 4;
   const uint K12_TM = 8;
   dim3 blockDim(K12_NUM_THREADS);
@@ -186,15 +184,13 @@ void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
   static_assert((K12_WM % K12_WMITER == 0) and (K12_WN % K12_WNITER == 0));
 
   static_assert((K12_NUM_THREADS * 4) % K12_BK == 0,
-                "NUM_THREADS*4 must be multiple of BK to avoid quantization "
-                "issues during GMEM->SMEM tiling");
+                "NUM_THREADS*4 must be multiple of BK");
   static_assert((K12_NUM_THREADS * 4) % K12_BN == 0,
-                "NUM_THREADS*4 must be multiple of BN to avoid quantization "
-                "issues during GMEM->SMEM tiling");
+                "NUM_THREADS*4 must be multiple of BN");
   static_assert(K12_BN % (16 * K12_TN) == 0,
-                "BN must be a multiple of 16*TN to avoid quantization effects");
+                "BN must be a multiple of 16*TN");
   static_assert(K12_BM % (16 * K12_TM) == 0,
-                "BM must be a multiple of 16*TM to avoid quantization effects");
+                "BM must be a multiple of 16*TM");
   static_assert((K12_BM * K12_BK) % (4 * K12_NUM_THREADS) == 0,
                 "BM*BK must be a multiple of 4*NUM_THREADS to vectorize loads");
   static_assert((K12_BN * K12_BK) % (4 * K12_NUM_THREADS) == 0,
