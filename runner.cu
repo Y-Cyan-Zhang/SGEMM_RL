@@ -52,8 +52,6 @@ void CudaDeviceInfo() {
 };
 
 void randomize_matrix(float *mat, int N) {
-  // NOTICE: Use gettimeofday instead of srand((unsigned)time(NULL)); the time
-  // precision is too low and the same random number is generated.
   struct timeval time {};
   gettimeofday(&time, nullptr);
   srand(time.tv_usec);
@@ -87,11 +85,11 @@ void copy_matrix(const float *src, float *dest, int N) {
 void print_matrix(const float *A, int M, int N, std::ofstream &fs) {
   int i;
   fs << std::setprecision(2)
-     << std::fixed; // Set floating-point precision and fixed notation
+     << std::fixed;
   fs << "[";
   for (i = 0; i < M * N; i++) {
     if ((i + 1) % N == 0)
-      fs << std::setw(5) << A[i]; // Set field width and write the value
+      fs << std::setw(5) << A[i];
     else
       fs << std::setw(5) << A[i] << ", ";
     if ((i + 1) % N == 0) {
@@ -123,9 +121,6 @@ int div_ceil(int numerator, int denominator) {
 
 void runCublasFP32(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
-  // cuBLAS uses column-major order. So we change the order of our row-major A &
-  // B, since (B^T*A^T)^T = (A*B)
-  // This runs cuBLAS in full fp32 mode
   cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
                N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -133,8 +128,6 @@ void runCublasFP32(cublasHandle_t handle, int M, int N, int K, float alpha,
 
 void runCublasBF16(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
-  // This runs cuBLAS with mixed precision (performing the mul with operands
-  // downcast to bf16), which is ~4x faster
   cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
                N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N,
                CUBLAS_COMPUTE_32F_FAST_16BF, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -142,8 +135,6 @@ void runCublasBF16(cublasHandle_t handle, int M, int N, int K, float alpha,
 
 void runCublasTF32(cublasHandle_t handle, int M, int N, int K, float alpha,
                    float *A, float *B, float beta, float *C) {
-  // This runs cuBLAS with mixed precision (performing the mul with operands
-  // downcast to bf16), which is ~4x faster
   cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, B, CUDA_R_32F,
                N, A, CUDA_R_32F, K, &beta, C, CUDA_R_32F, N,
                CUBLAS_COMPUTE_32F_FAST_TF32, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -151,7 +142,24 @@ void runCublasTF32(cublasHandle_t handle, int M, int N, int K, float alpha,
 
 void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
                               float *B, float beta, float *C) {
-  // Settings for A6000
+  // =====================================================================
+  // Tile parameters tuned for T4 (SM 7.5)
+  //
+  // T4 specs:
+  //   - 40 SMs, 64 KB shared memory/SM, 65536 regs/SM
+  //   - 320 GB/s memory BW, ~8.1 TFLOPS FP32
+  //   - No hardware async copy (cp.async requires SM 8.0+)
+  //
+  // SMEM usage: 2 * (BM*BK + BK*BN) * 4 bytes
+  //   = 2 * (128*16 + 16*128) * 4 = 32768 bytes = 32 KB
+  //   -> 2 blocks can run per SM (2*32KB = 64KB ≤ 64KB limit)
+  //
+  // Register usage per thread:
+  //   threadResults = WMITER*TM*WNITER*TN = 2*8*4*4 = 256 floats (regs)
+  //   regM = WMITER*TM = 16, regN = WNITER*TN = 16
+  //   Total ~288 regs/thread → with 128 threads = ~288 regs/thread
+  //   65536 regs/SM / 128 threads = 512 regs/thread available → fits
+  // =====================================================================
   const uint K12_NUM_THREADS = 128;
   const uint K12_BN = 128;
   const uint K12_BM = 128;
@@ -178,21 +186,19 @@ void runSgemmDoubleBuffering2(int M, int N, int K, float alpha, float *A,
   static_assert((K12_WM % K12_WMITER == 0) and (K12_WN % K12_WNITER == 0));
 
   static_assert((K12_NUM_THREADS * 4) % K12_BK == 0,
-                "NUM_THREADS*4 must be multiple of K9_BK to avoid quantization "
-                "issues during GMEM->SMEM tiling (loading only parts of the "
-                "final row of Bs during each iteraion)");
+                "NUM_THREADS*4 must be multiple of BK to avoid quantization "
+                "issues during GMEM->SMEM tiling");
   static_assert((K12_NUM_THREADS * 4) % K12_BN == 0,
-                "NUM_THREADS*4 must be multiple of K9_BN to avoid quantization "
-                "issues during GMEM->SMEM tiling (loading only parts of the "
-                "final row of As during each iteration)");
+                "NUM_THREADS*4 must be multiple of BN to avoid quantization "
+                "issues during GMEM->SMEM tiling");
   static_assert(K12_BN % (16 * K12_TN) == 0,
                 "BN must be a multiple of 16*TN to avoid quantization effects");
   static_assert(K12_BM % (16 * K12_TM) == 0,
                 "BM must be a multiple of 16*TM to avoid quantization effects");
   static_assert((K12_BM * K12_BK) % (4 * K12_NUM_THREADS) == 0,
-                "BM*BK must be a multiple of 4*256 to vectorize loads");
+                "BM*BK must be a multiple of 4*NUM_THREADS to vectorize loads");
   static_assert((K12_BN * K12_BK) % (4 * K12_NUM_THREADS) == 0,
-                "BN*BK must be a multiple of 4*256 to vectorize loads");
+                "BN*BK must be a multiple of 4*NUM_THREADS to vectorize loads");
 
   dim3 gridDim(CEIL_DIV(N, K12_BN), CEIL_DIV(M, K12_BM));
   runSgemmDoubleBuffering2<K12_BM, K12_BN, K12_BK, K12_WM, K12_WN, K12_WNITER,
