@@ -3,8 +3,8 @@
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <fstream>
-#include <stdio>
-#include <stdlib>
+#include <cstdio>
+#include <cstdlib>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
